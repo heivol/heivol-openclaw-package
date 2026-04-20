@@ -20,9 +20,10 @@ agent_type: generic
 embedding_model: BAAI/bge-small-en-v1.5
 
 retention:
-  signals_raw_days: 30
-  signals_compact_days: 365
-  analysis_keep_days: 730
+  signals_raw_days: 30        # raw signals → compacted weekly after this
+  signals_compact_days: 365   # compacted signal files kept this long
+  analysis_keep_days: 730     # daily meta-analyses archived after this
+  diary_archive: false        # when true, yearly.sh rolls old diaries into a single file
 
 # Closed vocabulary for auto-categorization. Extend freely.
 categories:

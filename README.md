@@ -60,16 +60,37 @@ See [docs/concepts.md](docs/concepts.md) for the overlay model, [docs/customizat
 | `skills/ingest/` | Turn a source into summary + entity pages with cascading links |
 | `skills/search/` | Semantic search wrapper over the vault |
 | `skills/lint/` | Vault health checks (orphans, broken links, stale content) |
+| `skills/briefing/` | Forward-looking digest: upcoming + open loops |
 | `bin/vault-search` | CLI: sqlite-vec + local embedding search |
-| `bin/vault-index` | CLI: incremental embedding index |
+| `bin/vault-index` | CLI: incremental embedding index + schedules table |
 | `bin/vault-categorize` | CLI: classify a note into a tag vocabulary via LLM |
 | `bin/vault-ingest-transcripts` | CLI: fold agent session transcripts into the diary |
+| `bin/vault-briefing` | CLI: upcoming (`due`/`remind`) + open loops |
+| `bin/vault-rollup` | CLI: week/month/year-scoped summary writer |
 | `bin/meta-analyze` | CLI: read recent signals, write analysis + proposals |
 | `bin/vault-lint` | CLI: vault health; `--fix` applies safe fixes |
 | `bin/openclaw-doctor` | CLI: checks the install is healthy |
 | `hooks/log-signal.sh` | Session-end hook; appends metadata JSONL |
-| `schedules/daily.sh` | Daily: index + lint + meta-analyze + digest |
+| `schedules/daily.sh` | Daily: index + lint + meta-analyze + transcript ingest |
+| `schedules/weekly.sh` | Sun 22:00: weekly rollup + signal compaction + stale proposals |
+| `schedules/monthly.sh` | 1st of month: monthly rollup + maintenance + vault size |
+| `schedules/yearly.sh` | Stub (opt-in): yearly rollup + optional diary archival |
 | `vault-template/` | Initial vault scaffolding |
+
+## Frontmatter
+
+Package-aware frontmatter fields — see [docs/frontmatter.md](docs/frontmatter.md):
+
+```yaml
+---
+schema: 1
+type: diary | note | entity | source | proposal | meta-analysis | briefing | rollup
+status: active | in-progress | done | cancelled
+due: YYYY-MM-DD            # briefing surfaces when today ≤ due
+remind: YYYY-MM-DD          # briefing surfaces around this date
+tags: []
+---
+```
 
 ## Configuration
 

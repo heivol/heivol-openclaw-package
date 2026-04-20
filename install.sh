@@ -97,16 +97,26 @@ if command -v pip3 >/dev/null 2>&1; then
   run "pip3 install --user -q -r '$PACKAGE_DIR/requirements.txt' || true"
 fi
 
-# 7. Daily cron
-CRON_MARK="# heivol-openclaw-package daily"
-CRON_LINE="5 3 * * * $RUNTIME_DIR/schedules/daily.sh >> $ROOT/daily.log 2>&1 $CRON_MARK"
+# 7. Cron entries
 if command -v crontab >/dev/null 2>&1; then
-  if ! crontab -l 2>/dev/null | grep -Fq "$CRON_MARK"; then
-    log "registering daily cron"
-    run "(crontab -l 2>/dev/null; echo '$CRON_LINE') | crontab -"
-  else
-    log "daily cron already registered"
-  fi
+  register_cron() {
+    local mark="$1"
+    local line="$2"
+    if crontab -l 2>/dev/null | grep -Fq "$mark"; then
+      log "$mark already registered"
+    else
+      log "registering: $mark"
+      run "(crontab -l 2>/dev/null; echo '$line') | crontab -"
+    fi
+  }
+
+  register_cron "# heivol-openclaw-package daily" \
+    "5 3 * * *  $RUNTIME_DIR/schedules/daily.sh   >> $ROOT/daily.log   2>&1 # heivol-openclaw-package daily"
+  register_cron "# heivol-openclaw-package weekly" \
+    "0 22 * * 0 $RUNTIME_DIR/schedules/weekly.sh  >> $ROOT/weekly.log  2>&1 # heivol-openclaw-package weekly"
+  register_cron "# heivol-openclaw-package monthly" \
+    "35 3 1 * * $RUNTIME_DIR/schedules/monthly.sh >> $ROOT/monthly.log 2>&1 # heivol-openclaw-package monthly"
+  # Yearly is intentionally not registered — opt-in per tenant.
 fi
 
 log "done. Run: $PACKAGE_DIR/bin/openclaw-doctor"

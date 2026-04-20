@@ -38,9 +38,18 @@ Both routes:
 
 1. Write a markdown file with YAML frontmatter.
 2. Call `vault-categorize` → LLM tags the note against a closed vocabulary.
-3. Call `vault-index --file` → embedding refresh for search.
+3. Call `vault-index --file` → embedding refresh for search **and** schedules-table refresh (extracts `type`/`status`/`due`/`remind` for cheap briefing queries).
 
 Search (`vault-search`) is semantic, runs fully local (sqlite-vec + a small sentence-transformer), and is always the first place the harness looks before fresh research or grep.
+
+**Briefing** (`vault-briefing` + `skills/briefing/`) is the forward-looking view:
+
+- **Upcoming** — notes whose `due` or `remind` date is within the horizon, pulled from the schedules table
+- **Open loops** — stale in-progress notes, overdue items, open proposals, orphaned sources
+
+Triggered on demand via the briefing skill (`"what's upcoming"`, `"brief me"`). Not on a schedule — context drives when it runs.
+
+**Rollups** (`vault-rollup`) are the retrospective view at week/month/year scope, written by the weekly/monthly/yearly schedules.
 
 ## Meta harness
 

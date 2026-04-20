@@ -16,6 +16,7 @@ Options:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import re
 import sys
@@ -32,6 +33,9 @@ except ImportError as e:
 VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
 
 WIKI = re.compile(r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]")
+
+KNOWN_TYPES = {"diary", "note", "entity", "source", "proposal", "meta-analysis", "briefing", "rollup"}
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def walk() -> list[Path]:
@@ -72,8 +76,12 @@ def lint(files: list[Path], stale_days: int) -> dict:
     broken: list[tuple[Path, str]] = []
     missing_fm: list[Path] = []
     stale: list[Path] = []
+    bad_dates: list[tuple[Path, str, str]] = []
+    unknown_types: list[tuple[Path, str]] = []
+    overdue: list[tuple[Path, str]] = []
     now = time.time()
     stale_cutoff = now - stale_days * 86400
+    today = dt.date.today()
 
     for f in files:
         try:
@@ -84,8 +92,31 @@ def lint(files: list[Path], stale_days: int) -> dict:
         if post is None or not post.metadata:
             missing_fm.append(f)
         else:
-            if post.metadata.get("status") == "in-progress" and f.stat().st_mtime < stale_cutoff:
+            meta = post.metadata
+            if meta.get("status") == "in-progress" and f.stat().st_mtime < stale_cutoff:
                 stale.append(f)
+
+            for field in ("due", "remind"):
+                v = meta.get(field)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if not ISO_DATE.match(s):
+                    bad_dates.append((f, field, s))
+                    continue
+                if field == "due":
+                    try:
+                        d = dt.date.fromisoformat(s)
+                    except ValueError:
+                        bad_dates.append((f, field, s))
+                        continue
+                    status = str(meta.get("status") or "").strip()
+                    if d < today and status not in ("done", "cancelled"):
+                        overdue.append((f, s))
+
+            t = meta.get("type")
+            if t is not None and str(t).strip() not in KNOWN_TYPES:
+                unknown_types.append((f, str(t).strip()))
 
         for m in WIKI.finditer(body):
             target = normalize_link(m.group(1), f)
@@ -114,6 +145,9 @@ def lint(files: list[Path], stale_days: int) -> dict:
         "missing_fm": missing_fm,
         "stale": stale,
         "duplicates": dupes,
+        "bad_dates": bad_dates,
+        "unknown_types": unknown_types,
+        "overdue": overdue,
     }
 
 
@@ -130,31 +164,50 @@ def apply_fixes(findings: dict) -> int:
     return count
 
 
+def _rel(p) -> str:
+    try:
+        return str(Path(p).relative_to(VAULT))
+    except ValueError:
+        return str(p)
+
+
 def format_report(findings: dict) -> str:
     lines = ["# Vault Lint Report", ""]
-    for section, key in [
+    sections = [
         ("Orphans", "orphans"),
         ("Broken wiki-links", "broken"),
         ("Missing frontmatter", "missing_fm"),
         ("Stale (in-progress, no change)", "stale"),
+        ("Overdue (due passed, not done)", "overdue"),
+        ("Invalid date fields", "bad_dates"),
+        ("Unknown type values", "unknown_types"),
         ("Duplicate entities", "duplicates"),
-    ]:
-        items = findings[key]
+    ]
+    for section, key in sections:
+        items = findings.get(key, [])
         lines.append(f"## {section} ({len(items)})")
         lines.append("")
         if not items:
             lines.append("_none_")
         else:
             for it in items[:50]:
-                if isinstance(it, tuple) and len(it) == 2 and isinstance(it[1], str):
+                if key == "bad_dates":
+                    f, field, value = it
+                    lines.append(f"- `{_rel(f)}` — `{field}: {value}` is not ISO YYYY-MM-DD")
+                elif key == "unknown_types":
+                    f, value = it
+                    lines.append(f"- `{_rel(f)}` — `type: {value}` not in schema")
+                elif key == "overdue":
+                    f, due = it
+                    lines.append(f"- `{_rel(f)}` — due `{due}`")
+                elif key == "broken":
                     f, target = it
-                    rel = Path(f).relative_to(VAULT)
-                    lines.append(f"- `{rel}` → `[[{target}]]`")
-                elif isinstance(it, tuple):
+                    lines.append(f"- `{_rel(f)}` → `[[{target}]]`")
+                elif key == "duplicates":
                     a, b = it
-                    lines.append(f"- `{Path(a).relative_to(VAULT)}` ≈ `{Path(b).relative_to(VAULT)}`")
+                    lines.append(f"- `{_rel(a)}` ≈ `{_rel(b)}`")
                 else:
-                    lines.append(f"- `{Path(it).relative_to(VAULT)}`")
+                    lines.append(f"- `{_rel(it)}`")
             if len(items) > 50:
                 lines.append(f"- _(+ {len(items) - 50} more)_")
         lines.append("")

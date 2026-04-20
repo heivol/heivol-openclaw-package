@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Forward-looking briefing — what's upcoming and what's unfinished.
+
+Reads the `schedules` table built by vault-index (cheap — no frontmatter
+re-parse), plus a few targeted scans of meta/proposals/ and sources/.
+
+Output is two sections:
+
+  ## Upcoming (forward)
+    Notes whose `due` or `remind` date is in [today, today + horizon].
+
+  ## Open loops (past, unfinished)
+    - status:in-progress with no change in stale_days
+    - due: < today, status != done
+    - open proposals
+    - ingested sources not yet referenced by any entity page
+
+Modes:
+    vault-briefing                 # stdout
+    vault-briefing --write         # vault/briefings/YYYY-MM-DD.md
+    vault-briefing --horizon 30    # 30-day forward window (default 7)
+    vault-briefing --stale-days 14 # what counts as "not moving"
+    vault-briefing --json          # machine-readable output
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+DB_PATH = ROOT / "cache" / "vault-index.sqlite"
+
+# Forward window: how many days past `remind:` the note still shows
+REMIND_TAIL_DAYS = 7
+
+WIKI = re.compile(r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]")
+
+
+def parse_date(s: str) -> dt.date | None:
+    if not s:
+        return None
+    try:
+        return dt.date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def fetch_upcoming(conn: sqlite3.Connection, today: dt.date, horizon: int) -> list[dict]:
+    """Notes with due or remind within the forward window."""
+    horizon_date = today + dt.timedelta(days=horizon)
+    tail = today - dt.timedelta(days=REMIND_TAIL_DAYS)
+    rows = conn.execute(
+        "SELECT path, type, status, due, remind FROM schedules "
+        "WHERE (due != '' OR remind != '') AND (status != 'done' AND status != 'cancelled')"
+    ).fetchall()
+
+    out = []
+    for path, type_, status, due, remind in rows:
+        due_d = parse_date(due)
+        remind_d = parse_date(remind)
+        reasons: list[tuple[dt.date, str]] = []
+        if due_d and today <= due_d <= horizon_date:
+            reasons.append((due_d, f"due {due_d.isoformat()}"))
+        if remind_d and tail <= remind_d <= horizon_date:
+            reasons.append((remind_d, f"remind {remind_d.isoformat()}"))
+        if not reasons:
+            continue
+        reasons.sort()
+        soonest_date, reason_str = reasons[0]
+        out.append({
+            "path": path,
+            "type": type_,
+            "status": status,
+            "date": soonest_date.isoformat(),
+            "reason": ", ".join(r[1] for r in reasons),
+        })
+    out.sort(key=lambda r: r["date"])
+    return out
+
+
+def fetch_open_loops(conn: sqlite3.Connection, today: dt.date, stale_days: int) -> dict:
+    now_ts = int(dt.datetime.combine(today, dt.time()).timestamp())
+    stale_cutoff = now_ts - stale_days * 86400
+
+    stale_rows = conn.execute(
+        "SELECT path, type, status, mtime FROM schedules "
+        "WHERE status = 'in-progress' AND mtime < ?",
+        (stale_cutoff,),
+    ).fetchall()
+
+    overdue_rows = conn.execute(
+        "SELECT path, type, status, due FROM schedules "
+        "WHERE due != '' AND due < ? AND status != 'done' AND status != 'cancelled'",
+        (today.isoformat(),),
+    ).fetchall()
+
+    proposals = scan_open_proposals()
+    orphan_sources = scan_orphan_sources(conn)
+
+    return {
+        "stale_in_progress": [
+            {"path": p, "type": t, "status": s, "days_stale": (now_ts - mt) // 86400}
+            for (p, t, s, mt) in stale_rows
+        ],
+        "overdue": [
+            {"path": p, "type": t, "status": s, "due": due}
+            for (p, t, s, due) in overdue_rows
+        ],
+        "open_proposals": proposals,
+        "orphan_sources": orphan_sources,
+    }
+
+
+def scan_open_proposals() -> list[dict]:
+    d = VAULT / "meta" / "proposals"
+    if not d.exists():
+        return []
+    out = []
+    for f in sorted(d.glob("*.md")):
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        status = ""
+        m = re.search(r"^status:\s*(\S+)", text, re.MULTILINE)
+        if m:
+            status = m.group(1).strip()
+        if status in ("", "open"):
+            out.append({"path": str(f), "name": f.stem})
+    return out
+
+
+def scan_orphan_sources(conn: sqlite3.Connection) -> list[dict]:
+    """Sources no entity page wiki-links back to."""
+    sources_dir = VAULT / "sources"
+    entities_dir = VAULT / "entities"
+    if not sources_dir.exists():
+        return []
+
+    linked: set[str] = set()
+    if entities_dir.exists():
+        for f in entities_dir.rglob("*.md"):
+            try:
+                body = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for m in WIKI.finditer(body):
+                target = m.group(1).strip()
+                if target.endswith(".md"):
+                    target = target[:-3]
+                linked.add(target.split("/")[-1])
+                linked.add(target)
+
+    out = []
+    for f in sorted(sources_dir.rglob("*.md")):
+        stem = f.stem
+        if stem in linked or f"sources/{stem}" in linked:
+            continue
+        out.append({"path": str(f), "name": stem})
+    return out[:20]
+
+
+def format_report(today: dt.date, upcoming: list[dict], loops: dict, horizon: int) -> str:
+    lines = [
+        "---",
+        f"date: {today.isoformat()}",
+        "type: briefing",
+        "schema: 1",
+        "---",
+        "",
+        f"# Briefing — {today.isoformat()}",
+        "",
+        f"Forward window: **{horizon} days**.",
+        "",
+        "## Upcoming (forward)",
+        "",
+    ]
+    if not upcoming:
+        lines.append("_Nothing scheduled._")
+    else:
+        by_week: dict[str, list[dict]] = defaultdict(list)
+        for u in upcoming:
+            d = dt.date.fromisoformat(u["date"])
+            week = f"{d.isocalendar().year}-W{d.isocalendar().week:02d}"
+            by_week[week].append(u)
+        for week, items in sorted(by_week.items()):
+            lines.append(f"### {week}")
+            lines.append("")
+            for u in items:
+                rel = relpath(u["path"])
+                lines.append(f"- `{u['date']}` [[{rel}]] — {u['reason']}")
+            lines.append("")
+
+    lines.append("## Open loops (past, unfinished)")
+    lines.append("")
+
+    sections: list[tuple[str, list]] = [
+        ("Stale in-progress", loops["stale_in_progress"]),
+        ("Overdue (past due, not done)", loops["overdue"]),
+        ("Open proposals", loops["open_proposals"]),
+        ("Ingested sources, no entity backlinks", loops["orphan_sources"]),
+    ]
+    total = sum(len(items) for _, items in sections)
+    if total == 0:
+        lines.append("_Clear._")
+    else:
+        for heading, items in sections:
+            if not items:
+                continue
+            lines.append(f"### {heading} ({len(items)})")
+            lines.append("")
+            for it in items[:25]:
+                if "days_stale" in it:
+                    lines.append(f"- [[{relpath(it['path'])}]] — stale {it['days_stale']}d")
+                elif "due" in it:
+                    lines.append(f"- [[{relpath(it['path'])}]] — due {it['due']}")
+                else:
+                    lines.append(f"- [[{relpath(it['path'])}]]")
+            if len(items) > 25:
+                lines.append(f"- _(+{len(items) - 25} more)_")
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def relpath(p: str) -> str:
+    try:
+        rel = Path(p).relative_to(VAULT)
+        return str(rel).replace(".md", "")
+    except ValueError:
+        return p
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Forward-looking briefing")
+    ap.add_argument("--horizon", type=int, default=7, help="Days forward to surface")
+    ap.add_argument("--stale-days", type=int, default=14)
+    ap.add_argument("--write", action="store_true", help="Write to vault/briefings/YYYY-MM-DD.md")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if not DB_PATH.exists():
+        print("vault-briefing: no index yet — run vault-index first", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(DB_PATH)
+    today = dt.date.today()
+    upcoming = fetch_upcoming(conn, today, args.horizon)
+    loops = fetch_open_loops(conn, today, args.stale_days)
+    conn.close()
+
+    if args.json:
+        print(json.dumps({"date": today.isoformat(), "upcoming": upcoming, "open_loops": loops}, indent=2))
+        return 0
+
+    report = format_report(today, upcoming, loops, args.horizon)
+    if args.write:
+        out_dir = VAULT / "briefings"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{today.isoformat()}.md"
+        out.write_text(report, encoding="utf-8")
+        print(f"wrote {out.relative_to(VAULT)}")
+    else:
+        print(report)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,6 +6,10 @@ Index layout: sqlite-vec DB at $OPENCLAW_ROOT/cache/vault-index.sqlite
     files(path TEXT PK, mtime INT, title TEXT)
     chunks(chunk_id INTEGER PK, path TEXT, start INT, end INT, text TEXT)
     vec_chunks(chunk_id, embedding)
+    schedules(path TEXT PK, type TEXT, status TEXT, due TEXT, remind TEXT, mtime INT)
+
+The `schedules` table is read by `vault-briefing` — frontmatter-extracted
+columns (type, status, due, remind) kept denormalized for cheap queries.
 
 Incremental: files whose mtime matches the stored row are skipped.
 
@@ -25,6 +29,7 @@ from pathlib import Path
 
 try:
     import sqlite_vec
+    import frontmatter
     from sentence_transformers import SentenceTransformer
 except ImportError as e:
     print(f"vault-index: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
@@ -51,11 +56,34 @@ def connect() -> sqlite3.Connection:
         "chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "path TEXT, start INTEGER, end INTEGER, text TEXT)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schedules ("
+        "path TEXT PRIMARY KEY, type TEXT, status TEXT, "
+        "due TEXT, remind TEXT, mtime INTEGER)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(due)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_remind ON schedules(remind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_status ON schedules(status)")
     dim = 384  # bge-small default
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])"
     )
     return conn
+
+
+def extract_schedule_fields(path: Path) -> dict:
+    """Pull type/status/due/remind from frontmatter. Returns empty-string defaults."""
+    try:
+        post = frontmatter.load(path)
+    except Exception:
+        return {"type": "", "status": "", "due": "", "remind": ""}
+    meta = post.metadata or {}
+    def s(k: str) -> str:
+        v = meta.get(k)
+        if v is None:
+            return ""
+        return str(v).strip()
+    return {"type": s("type"), "status": s("status"), "due": s("due"), "remind": s("remind")}
 
 
 def chunk_text(text: str) -> list[tuple[int, int, str]]:
@@ -85,6 +113,7 @@ def reindex_file(conn: sqlite3.Connection, model, path: Path) -> bool:
         mtime = int(path.stat().st_mtime)
     except FileNotFoundError:
         conn.execute("DELETE FROM files WHERE path = ?", (str(path),))
+        conn.execute("DELETE FROM schedules WHERE path = ?", (str(path),))
         return False
 
     row = conn.execute("SELECT mtime FROM files WHERE path = ?", (str(path),)).fetchone()
@@ -117,6 +146,13 @@ def reindex_file(conn: sqlite3.Connection, model, path: Path) -> bool:
     conn.execute(
         "INSERT OR REPLACE INTO files (path, mtime, title) VALUES (?, ?, ?)",
         (str(path), mtime, title),
+    )
+
+    sched = extract_schedule_fields(path)
+    conn.execute(
+        "INSERT OR REPLACE INTO schedules (path, type, status, due, remind, mtime) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (str(path), sched["type"], sched["status"], sched["due"], sched["remind"], mtime),
     )
     return True
 
