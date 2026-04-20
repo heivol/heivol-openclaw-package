@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Build / refresh the embedding index for the vault.
+
+Index layout: sqlite-vec DB at $OPENCLAW_ROOT/cache/vault-index.sqlite
+  tables:
+    files(path TEXT PK, mtime INT, title TEXT)
+    chunks(chunk_id INTEGER PK, path TEXT, start INT, end INT, text TEXT)
+    vec_chunks(chunk_id, embedding)
+
+Incremental: files whose mtime matches the stored row are skipped.
+
+Usage:
+    vault-index                    # full vault, incremental
+    vault-index --file <path>      # reindex a single file
+    vault-index --rebuild          # wipe and rebuild from scratch
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+try:
+    import sqlite_vec
+    from sentence_transformers import SentenceTransformer
+except ImportError as e:
+    print(f"vault-index: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+CACHE = ROOT / "cache"
+DB_PATH = CACHE / "vault-index.sqlite"
+MODEL_NAME = os.environ.get("OPENCLAW_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+CHUNK_CHARS = 800
+CHUNK_OVERLAP = 120
+
+
+def connect() -> sqlite3.Connection:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime INTEGER, title TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chunks ("
+        "chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "path TEXT, start INTEGER, end INTEGER, text TEXT)"
+    )
+    dim = 384  # bge-small default
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])"
+    )
+    return conn
+
+
+def chunk_text(text: str) -> list[tuple[int, int, str]]:
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = min(i + CHUNK_CHARS, n)
+        out.append((i, j, text[i:j]))
+        if j >= n:
+            break
+        i = j - CHUNK_OVERLAP
+    return out
+
+
+def extract_title(text: str, fallback: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()
+    return fallback
+
+
+def reindex_file(conn: sqlite3.Connection, model, path: Path) -> bool:
+    """Returns True if (re)indexed, False if skipped (mtime match)."""
+    try:
+        mtime = int(path.stat().st_mtime)
+    except FileNotFoundError:
+        conn.execute("DELETE FROM files WHERE path = ?", (str(path),))
+        return False
+
+    row = conn.execute("SELECT mtime FROM files WHERE path = ?", (str(path),)).fetchone()
+    if row and row[0] == mtime:
+        return False
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    title = extract_title(text, path.stem)
+
+    # Delete old rows
+    old_ids = [r[0] for r in conn.execute("SELECT chunk_id FROM chunks WHERE path = ?", (str(path),))]
+    if old_ids:
+        placeholders = ",".join("?" * len(old_ids))
+        conn.execute(f"DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})", old_ids)
+        conn.execute("DELETE FROM chunks WHERE path = ?", (str(path),))
+
+    # Insert chunks + embeddings
+    for start, end, body in chunk_text(text):
+        cur = conn.execute(
+            "INSERT INTO chunks (path, start, end, text) VALUES (?, ?, ?, ?)",
+            (str(path), start, end, body),
+        )
+        chunk_id = cur.lastrowid
+        emb = model.encode(body, normalize_embeddings=True).tolist()
+        conn.execute(
+            "INSERT INTO vec_chunks (rowid, embedding) VALUES (?, ?)",
+            (chunk_id, sqlite_vec.serialize_float32(emb)),
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO files (path, mtime, title) VALUES (?, ?, ?)",
+        (str(path), mtime, title),
+    )
+    return True
+
+
+def walk_vault() -> list[Path]:
+    out = []
+    for dirpath, _dirs, files in os.walk(VAULT):
+        if "/.git" in dirpath or "/.obsidian" in dirpath:
+            continue
+        for name in files:
+            if name.endswith(".md"):
+                out.append(Path(dirpath) / name)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build / refresh vault embedding index")
+    ap.add_argument("--file", help="Reindex a single file")
+    ap.add_argument("--rebuild", action="store_true", help="Wipe and rebuild")
+    args = ap.parse_args()
+
+    if args.rebuild and DB_PATH.exists():
+        DB_PATH.unlink()
+
+    model = SentenceTransformer(MODEL_NAME, cache_folder=str(CACHE / "models"))
+    conn = connect()
+
+    start = time.time()
+    changed = 0
+    skipped = 0
+
+    if args.file:
+        paths = [Path(args.file).resolve()]
+    else:
+        paths = walk_vault()
+
+    for p in paths:
+        if reindex_file(conn, model, p):
+            changed += 1
+        else:
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+    dur = time.time() - start
+    print(f"indexed {changed} file(s), skipped {skipped}, {dur:.1f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

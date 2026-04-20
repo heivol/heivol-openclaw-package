@@ -1,0 +1,36 @@
+# heivol-openclaw-package configuration
+# Copied to ~/.openclaw/user/config.yaml by install.sh
+
+vault_path: ~/vault
+
+# Command used to call the LLM for categorization and meta-analysis.
+# Must accept a prompt on stdin and write completion to stdout.
+# Empty string disables LLM features (search still works locally).
+#
+# Examples:
+#   llm_cmd: "heivol-modelproxy prompt"
+#   llm_cmd: "ollama run llama3"
+llm_cmd: ""
+
+# Host harness adapter. Must match a script in adapters/install-for-<name>.sh
+agent_type: generic
+
+# Embedding model used by vault-index / vault-search.
+# Downloaded once into ~/.openclaw/cache/ on first use.
+embedding_model: BAAI/bge-small-en-v1.5
+
+retention:
+  signals_raw_days: 30
+  signals_compact_days: 365
+  analysis_keep_days: 730
+
+# Closed vocabulary for auto-categorization. Extend freely.
+categories:
+  - work
+  - decision
+  - idea
+  - reference
+  - incident
+  - personal
+  - meeting
+  - todo

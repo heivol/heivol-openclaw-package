@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Classify a note into the configured tag vocabulary and write tags to frontmatter.
+
+Uses the `llm` wrapper (provider-neutral). No-ops cleanly when llm_cmd is unset.
+
+Usage:
+    vault-categorize <path>
+    vault-categorize <path> --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import frontmatter
+    import yaml
+except ImportError as e:
+    print(f"vault-categorize: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+PACKAGE_DIR = Path(__file__).resolve().parent.parent
+LLM_BIN = ROOT / "runtime" / "bin" / "llm"
+if not LLM_BIN.exists():
+    LLM_BIN = PACKAGE_DIR / "bin" / "llm"
+
+CONFIG_PATH = ROOT / "user" / "config.yaml"
+DEFAULT_CATEGORIES = ["work", "decision", "idea", "reference", "incident", "personal", "meeting", "todo"]
+
+PROMPT_TEMPLATE = """\
+You are a tagging assistant. Read the note below and return a comma-separated list of tags from this closed vocabulary (no other tags allowed):
+
+{categories}
+
+Rules:
+- Return 1–4 tags, most-specific first.
+- Plain text only. No quotes, no explanation, no trailing punctuation.
+- If nothing fits, return: uncategorized
+
+Note:
+---
+{body}
+---
+Tags:"""
+
+
+def load_categories() -> list[str]:
+    if CONFIG_PATH.exists():
+        try:
+            cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+            cats = cfg.get("categories")
+            if isinstance(cats, list) and cats:
+                return [str(c) for c in cats]
+        except Exception:
+            pass
+    return DEFAULT_CATEGORIES
+
+
+def classify(body: str, categories: list[str]) -> list[str]:
+    prompt = PROMPT_TEMPLATE.format(categories=", ".join(categories), body=body[:4000])
+    try:
+        result = subprocess.run(
+            [str(LLM_BIN)],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        print("vault-categorize: llm wrapper not found", file=sys.stderr)
+        return []
+
+    if result.returncode == 2:
+        # llm_cmd not configured — silent skip
+        return []
+    if result.returncode != 0:
+        print(f"vault-categorize: llm exit {result.returncode}: {result.stderr.strip()}", file=sys.stderr)
+        return []
+
+    raw = result.stdout.strip().lower()
+    tags = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
+    allowed = {c.lower() for c in categories} | {"uncategorized"}
+    return [t for t in tags if t in allowed][:4]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Classify a note into tags via LLM")
+    ap.add_argument("path")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    path = Path(args.path).resolve()
+    if not path.exists():
+        print(f"vault-categorize: {path} not found", file=sys.stderr)
+        return 1
+
+    post = frontmatter.load(path)
+    categories = load_categories()
+    tags = classify(post.content, categories)
+
+    if not tags:
+        print(f"{path.name}: no tags (llm unavailable or empty response)")
+        return 0
+
+    if args.dry_run:
+        print(f"{path.name} → {tags}")
+        return 0
+
+    existing = post.metadata.get("tags") or []
+    if not isinstance(existing, list):
+        existing = [existing]
+    merged = sorted(set(existing) | set(tags))
+    post.metadata["tags"] = merged
+
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    print(f"{path.name}: tagged {tags}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

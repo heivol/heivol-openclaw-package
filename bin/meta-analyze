@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Analyze recent session signals and write a daily harness-improvement report.
+
+Reads: $OPENCLAW_VAULT/meta/signals/YYYY-MM-DD.jsonl (last 24h by default)
+Writes: $OPENCLAW_VAULT/meta/analysis/YYYY-MM-DD.md
+If a pattern recurs ≥3 days, drops a stub proposal into $OPENCLAW_VAULT/meta/proposals/.
+
+Signals are metadata only — no message content. Each line looks like:
+  {"ts": "...", "event": "session_end", "duration_s": 120, "tools": {"Read": 12, ...},
+   "skills": ["diary", "search"], "errors": 0, "corrections": 1}
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+LLM_BIN = ROOT / "runtime" / "bin" / "llm"
+if not LLM_BIN.exists():
+    LLM_BIN = Path(__file__).resolve().parent / "llm"
+
+SIGNALS = VAULT / "meta" / "signals"
+ANALYSIS = VAULT / "meta" / "analysis"
+PROPOSALS = VAULT / "meta" / "proposals"
+
+PROPOSAL_THRESHOLD_DAYS = 3
+
+
+def load_signals(days: int) -> list[dict]:
+    out = []
+    today = dt.date.today()
+    for i in range(days):
+        day = today - dt.timedelta(days=i)
+        f = SIGNALS / f"{day.isoformat()}.jsonl"
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def aggregate(signals: list[dict]) -> dict:
+    if not signals:
+        return {}
+    tool_usage: Counter = Counter()
+    skill_usage: Counter = Counter()
+    errors = 0
+    corrections = 0
+    total_duration = 0.0
+    session_count = 0
+    for s in signals:
+        session_count += 1
+        total_duration += s.get("duration_s", 0) or 0
+        errors += s.get("errors", 0) or 0
+        corrections += s.get("corrections", 0) or 0
+        for tool, n in (s.get("tools") or {}).items():
+            tool_usage[tool] += n
+        for skill in s.get("skills") or []:
+            skill_usage[skill] += 1
+    return {
+        "sessions": session_count,
+        "avg_duration_s": round(total_duration / max(session_count, 1), 1),
+        "top_tools": tool_usage.most_common(10),
+        "top_skills": skill_usage.most_common(10),
+        "errors": errors,
+        "corrections": corrections,
+    }
+
+
+def detect_patterns(signals: list[dict]) -> list[str]:
+    """Cheap heuristics. Anything that recurs in most sessions is worth surfacing."""
+    patterns = []
+    if not signals:
+        return patterns
+    n = len(signals)
+
+    # Correction rate
+    corrections = sum((s.get("corrections", 0) or 0) for s in signals)
+    if corrections / max(n, 1) >= 0.5:
+        patterns.append(f"High correction rate: {corrections} corrections across {n} sessions")
+
+    # Tool error recurrence
+    error_tools: Counter = Counter()
+    for s in signals:
+        for t in (s.get("tool_errors") or {}):
+            error_tools[t] += 1
+    for tool, count in error_tools.most_common(5):
+        if count >= max(3, n // 3):
+            patterns.append(f"Frequent errors from tool `{tool}` ({count} sessions)")
+
+    # Skill never used
+    all_available = set(s.get("skills_available") or [] for s in signals if s.get("skills_available"))
+    used = set()
+    for s in signals:
+        used.update(s.get("skills") or [])
+    for skill_set in all_available:
+        for skill in skill_set:
+            if skill not in used and n >= 5:
+                patterns.append(f"Skill `{skill}` available but never invoked in {n} sessions")
+                break
+
+    return patterns
+
+
+def write_analysis(day: dt.date, agg: dict, patterns: list[str], signals: list[dict]) -> Path:
+    ANALYSIS.mkdir(parents=True, exist_ok=True)
+    out = ANALYSIS / f"{day.isoformat()}.md"
+    lines = [
+        "---",
+        f"date: {day.isoformat()}",
+        "type: meta-analysis",
+        "schema: 1",
+        "---",
+        "",
+        f"# Meta-Analysis — {day.isoformat()}",
+        "",
+        f"_Based on {agg.get('sessions', 0)} session(s) over the last 24h._",
+        "",
+        "## Summary",
+        "",
+        f"- Sessions: **{agg.get('sessions', 0)}**",
+        f"- Avg duration: **{agg.get('avg_duration_s', 0)}s**",
+        f"- Total errors: **{agg.get('errors', 0)}**",
+        f"- User corrections: **{agg.get('corrections', 0)}**",
+        "",
+        "## Top tools",
+        "",
+    ]
+    for tool, n in agg.get("top_tools", []):
+        lines.append(f"- `{tool}` — {n}")
+    lines += ["", "## Top skills", ""]
+    for skill, n in agg.get("top_skills", []):
+        lines.append(f"- `{skill}` — {n}")
+
+    if patterns:
+        lines += ["", "## Patterns detected", ""]
+        for p in patterns:
+            lines.append(f"- {p}")
+
+    # Optional LLM narrative
+    narrative = llm_narrative(agg, patterns)
+    if narrative:
+        lines += ["", "## Narrative", "", narrative]
+
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
+def llm_narrative(agg: dict, patterns: list[str]) -> str:
+    if not agg:
+        return ""
+    prompt = (
+        "You are analyzing a single day of usage metadata from a personal-AI harness. "
+        "Write 2–3 sentences of plain-English observation focused on friction points or noteworthy shifts. "
+        "No boilerplate. No intro.\n\n"
+        f"Metadata:\n{json.dumps(agg, indent=2)}\n\n"
+        f"Patterns:\n" + "\n".join(f"- {p}" for p in patterns) + "\n\nObservation:"
+    )
+    try:
+        r = subprocess.run([str(LLM_BIN)], input=prompt, text=True, capture_output=True, timeout=60)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def maybe_propose(patterns: list[str], days: int = PROPOSAL_THRESHOLD_DAYS) -> None:
+    """Promote a pattern to a proposal if it's appeared on ≥N of the last N days."""
+    if not patterns:
+        return
+    PROPOSALS.mkdir(parents=True, exist_ok=True)
+
+    recent = load_signals(days)
+    recent_days: defaultdict[str, set] = defaultdict(set)
+    # Group signals by day and re-run detection per day — cheap for N=3.
+    by_day: defaultdict[dt.date, list] = defaultdict(list)
+    for s in recent:
+        try:
+            ts = dt.datetime.fromisoformat(s.get("ts", "").replace("Z", "+00:00"))
+            by_day[ts.date()].append(s)
+        except Exception:
+            continue
+
+    daily_patterns: dict[dt.date, list[str]] = {d: detect_patterns(sigs) for d, sigs in by_day.items()}
+    counter: Counter = Counter()
+    for plist in daily_patterns.values():
+        for p in plist:
+            counter[p] += 1
+
+    for pattern, count in counter.items():
+        if count < days:
+            continue
+        slug = (
+            pattern.lower()
+            .replace(" ", "-")
+            .replace("`", "")
+            .replace(":", "")
+            .replace(".", "")[:60]
+        )
+        f = PROPOSALS / f"{dt.date.today().isoformat()}-{slug}.md"
+        if f.exists():
+            continue
+        f.write_text(
+            "---\n"
+            f"date: {dt.date.today().isoformat()}\n"
+            "type: proposal\n"
+            "status: open\n"
+            "schema: 1\n"
+            "---\n\n"
+            f"# Proposal: {pattern}\n\n"
+            f"This pattern has recurred on {count} day(s). Worth investigating.\n\n"
+            "## Suggested actions\n\n"
+            "- _(fill in: new skill, rule, hook, config change)_\n",
+            encoding="utf-8",
+        )
+        print(f"proposal: {f.name}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Analyze session signals and emit a daily report")
+    ap.add_argument("--days", type=int, default=1, help="How many days back to include")
+    args = ap.parse_args()
+
+    signals = load_signals(args.days)
+    if not signals:
+        print("meta-analyze: no signals yet")
+        return 0
+
+    agg = aggregate(signals)
+    patterns = detect_patterns(signals)
+    out = write_analysis(dt.date.today(), agg, patterns, signals)
+    print(f"wrote {out.relative_to(VAULT)}")
+    maybe_propose(patterns)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

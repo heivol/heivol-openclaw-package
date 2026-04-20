@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Fold agent session transcripts into the diary.
+
+Reads JSONL transcripts from $OPENCLAW_TRANSCRIPTS_DIR (one session per file,
+one JSON object per line), generates a brief narrative summary via the LLM,
+and appends it to the day's diary file.
+
+Only processes transcripts whose mtime is newer than the marker file. Marker
+is bumped after a successful run.
+
+Usage:
+    vault-ingest-transcripts                    # pick up new transcripts
+    vault-ingest-transcripts --since 2026-04-19 # process from a specific date
+    vault-ingest-transcripts --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import frontmatter
+except ImportError as e:
+    print(f"vault-ingest-transcripts: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+TRANSCRIPTS = Path(os.environ.get("OPENCLAW_TRANSCRIPTS_DIR", Path.home() / ".openclaw" / "transcripts")).expanduser()
+LLM_BIN = ROOT / "runtime" / "bin" / "llm"
+if not LLM_BIN.exists():
+    LLM_BIN = Path(__file__).resolve().parent / "llm"
+
+MARKER = ROOT / "cache" / "ingest-transcripts.marker"
+
+SUMMARIZE_PROMPT = """\
+Summarize the following conversation transcript into 3–6 bullet points focused on:
+- What the user wanted
+- Key decisions or answers
+- Entities (people, projects, tools, concepts) that came up
+
+Be terse. No intro, no conclusion. Bullets only.
+
+Transcript:
+---
+{transcript}
+---
+Summary:"""
+
+
+def extract_transcript_text(path: Path, max_chars: int = 16000) -> str:
+    """Pull a readable text view from a JSONL transcript."""
+    lines = []
+    for raw in path.read_text(errors="ignore").splitlines():
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        role = obj.get("role") or obj.get("type") or ""
+        content = obj.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if "text" in part:
+                        parts.append(part["text"])
+                    elif "input" in part:
+                        parts.append(f"[tool call: {part.get('name', '?')}]")
+            content = "\n".join(parts)
+        elif not isinstance(content, str):
+            content = str(content) if content else ""
+        if role and content:
+            lines.append(f"[{role}] {content.strip()[:1500]}")
+    joined = "\n\n".join(lines)
+    return joined[-max_chars:]
+
+
+def summarize(text: str) -> str:
+    if not text.strip():
+        return ""
+    prompt = SUMMARIZE_PROMPT.format(transcript=text)
+    result = subprocess.run(
+        [str(LLM_BIN)], input=prompt, text=True, capture_output=True, timeout=120
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def append_to_diary(date: dt.date, transcript_name: str, summary: str) -> Path:
+    diary = VAULT / "diary" / f"{date.isoformat()}.md"
+    diary.parent.mkdir(parents=True, exist_ok=True)
+    if not diary.exists():
+        diary.write_text(
+            f"---\ndate: {date.isoformat()}\ntype: diary\nschema: 1\n---\n\n",
+            encoding="utf-8",
+        )
+    with diary.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Session — {transcript_name}\n\n_auto-ingested from transcript_\n\n{summary}\n")
+    return diary
+
+
+def get_marker_time() -> float:
+    if MARKER.exists():
+        return MARKER.stat().st_mtime
+    return 0.0
+
+
+def bump_marker() -> None:
+    MARKER.parent.mkdir(parents=True, exist_ok=True)
+    MARKER.touch()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Ingest agent transcripts into the diary")
+    ap.add_argument("--since", help="YYYY-MM-DD — process transcripts modified on/after this date")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    if not TRANSCRIPTS.exists():
+        print(f"vault-ingest-transcripts: no transcripts dir at {TRANSCRIPTS}")
+        return 0
+
+    cutoff = get_marker_time()
+    if args.since:
+        cutoff = dt.datetime.fromisoformat(args.since).timestamp()
+
+    processed = 0
+    for path in sorted(TRANSCRIPTS.glob("*.jsonl")):
+        if path.stat().st_mtime <= cutoff:
+            continue
+
+        text = extract_transcript_text(path)
+        if not text.strip():
+            continue
+
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime)
+        summary = summarize(text)
+        if not summary:
+            print(f"skipping {path.name}: no summary (llm unavailable?)", file=sys.stderr)
+            continue
+
+        if args.dry_run:
+            print(f"--- would ingest {path.name} into diary/{mtime.date()}.md ---")
+            print(summary)
+            print()
+        else:
+            diary = append_to_diary(mtime.date(), path.stem, summary)
+            print(f"ingested {path.name} → {diary.name}")
+        processed += 1
+
+    if not args.dry_run and processed > 0:
+        bump_marker()
+
+    print(f"processed {processed} transcript(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

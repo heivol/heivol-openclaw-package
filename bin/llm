@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Thin wrapper around $OPENCLAW_LLM_CMD.
+#
+# Reads a prompt from stdin, writes completion to stdout. Every bin that
+# needs an LLM call routes through this wrapper so the package stays
+# provider-neutral — only config.yaml knows which backend is in use.
+#
+# Usage:
+#   echo "your prompt" | llm
+#   llm < prompt.txt
+#
+# Exit codes:
+#   0  success
+#   2  llm_cmd not configured
+#   other  bubbled up from the backend
+
+set -euo pipefail
+
+CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/user/config.yaml}"
+
+# Parse llm_cmd from YAML without a YAML dependency — tolerate whitespace and quotes.
+llm_cmd=""
+if [ -f "$CONFIG" ]; then
+  llm_cmd="$(awk -F: '
+    /^llm_cmd[[:space:]]*:/ {
+      sub(/^[^:]*:[[:space:]]*/, "", $0)
+      gsub(/^["'\''`]|["'\''`]$/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      print
+      exit
+    }' "$CONFIG")"
+fi
+
+llm_cmd="${OPENCLAW_LLM_CMD:-$llm_cmd}"
+
+if [ -z "$llm_cmd" ]; then
+  echo "llm: OPENCLAW_LLM_CMD / llm_cmd is not set — skipping LLM call" >&2
+  exit 2
+fi
+
+exec sh -c "$llm_cmd"

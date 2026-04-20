@@ -1,0 +1,5 @@
+sqlite-vec>=0.1.6
+sentence-transformers>=2.7.0
+pyyaml>=6.0
+python-frontmatter>=1.1.0
+rich>=13.7.0

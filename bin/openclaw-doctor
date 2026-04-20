@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Check the openclaw-package install is healthy.
+
+Exits 0 if all checks pass, 1 otherwise.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+PACKAGE_DIR = Path(__file__).resolve().parent.parent
+
+OK = "\033[32m✓\033[0m"
+FAIL = "\033[31m✗\033[0m"
+WARN = "\033[33m!\033[0m"
+
+
+def check(label: str, cond, detail: str = "") -> bool:
+    status = OK if cond else FAIL
+    print(f"{status}  {label}" + (f"  — {detail}" if detail else ""))
+    return bool(cond)
+
+
+def warn(label: str, detail: str = "") -> None:
+    print(f"{WARN}  {label}" + (f"  — {detail}" if detail else ""))
+
+
+def main() -> int:
+    ok = True
+
+    ok &= check("package dir", PACKAGE_DIR.exists(), str(PACKAGE_DIR))
+    ok &= check(f"root: {ROOT}", ROOT.exists())
+    ok &= check(f"vault: {VAULT}", VAULT.exists())
+
+    for sub in ("user", "runtime", "cache"):
+        ok &= check(f"  {ROOT}/{sub}", (ROOT / sub).exists())
+
+    cfg = ROOT / "user" / "config.yaml"
+    ok &= check("config.yaml", cfg.exists(), str(cfg))
+
+    for d in ("diary", "entities", "meta/signals", "meta/analysis", "meta/proposals"):
+        ok &= check(f"  vault/{d}", (VAULT / d).exists())
+
+    py = shutil.which("python3")
+    ok &= check("python3", bool(py), py or "missing")
+
+    try:
+        import sqlite_vec  # noqa: F401
+        check("sqlite-vec", True)
+    except ImportError:
+        ok = False
+        check("sqlite-vec", False, "pip install -r requirements.txt")
+
+    try:
+        import sentence_transformers  # noqa: F401
+        check("sentence-transformers", True)
+    except ImportError:
+        ok = False
+        check("sentence-transformers", False, "pip install -r requirements.txt")
+
+    index = ROOT / "cache" / "vault-index.sqlite"
+    if index.exists():
+        try:
+            n = sqlite3.connect(index).execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            check("vault index", True, f"{n} file(s)")
+        except Exception as e:
+            warn("vault index exists but unreadable", str(e))
+    else:
+        warn("vault index missing", "run vault-index")
+
+    llm = os.environ.get("OPENCLAW_LLM_CMD", "")
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.strip().startswith("llm_cmd:"):
+                v = line.split(":", 1)[1].strip().strip("'\"")
+                if v:
+                    llm = llm or v
+                break
+    if llm:
+        check("llm_cmd configured", True, llm)
+    else:
+        warn("llm_cmd not configured", "LLM features (categorize, meta-analyze) will skip")
+
+    if shutil.which("crontab"):
+        try:
+            tab = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+            has_cron = "heivol-openclaw-package daily" in tab
+            check("daily cron registered", has_cron)
+        except Exception:
+            warn("unable to read crontab")
+
+    print()
+    print("OK" if ok else "Problems detected — fix and re-run")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Semantic search over the vault index built by vault-index.
+
+Usage:
+    vault-search "what did I decide about postgres"
+    vault-search "mobile release cut" --limit 3
+    vault-search "meeting with oliver" --scope diary
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+try:
+    import sqlite_vec
+    from sentence_transformers import SentenceTransformer
+except ImportError as e:
+    print(f"vault-search: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = Path(os.environ.get("OPENCLAW_ROOT", Path.home() / ".openclaw")).expanduser()
+CACHE = ROOT / "cache"
+DB_PATH = CACHE / "vault-index.sqlite"
+MODEL_NAME = os.environ.get("OPENCLAW_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Semantic search over the vault")
+    ap.add_argument("query")
+    ap.add_argument("--limit", type=int, default=8)
+    ap.add_argument("--scope", help="Restrict to files under vault/<scope>/")
+    ap.add_argument("--json", action="store_true", help="Machine-readable output")
+    args = ap.parse_args()
+
+    if not DB_PATH.exists():
+        print("vault-search: no index yet — run vault-index first", file=sys.stderr)
+        return 1
+
+    model = SentenceTransformer(MODEL_NAME, cache_folder=str(CACHE / "models"))
+    qvec = model.encode(args.query, normalize_embeddings=True).tolist()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+
+    scope_filter = ""
+    params: list = [sqlite_vec.serialize_float32(qvec), args.limit * 3]
+    if args.scope:
+        scope_filter = " AND c.path LIKE ?"
+        params.append(f"%/{args.scope}/%")
+
+    rows = conn.execute(
+        f"""
+        SELECT c.path, c.text, f.title, v.distance
+          FROM vec_chunks v
+          JOIN chunks c ON c.chunk_id = v.rowid
+          LEFT JOIN files f ON f.path = c.path
+         WHERE v.embedding MATCH ?
+               {scope_filter}
+         ORDER BY v.distance
+         LIMIT ?
+        """,
+        [params[0], *([params[2]] if args.scope else []), params[1]],
+    ).fetchall()
+
+    # Dedup by path, keep best chunk per path
+    seen: dict[str, tuple] = {}
+    for path, text, title, dist in rows:
+        if path not in seen or dist < seen[path][3]:
+            seen[path] = (path, text, title, dist)
+    results = sorted(seen.values(), key=lambda r: r[3])[: args.limit]
+
+    if args.json:
+        import json
+        out = [
+            {"path": p, "title": t or Path(p).stem, "score": round(1 - d, 3), "snippet": text.strip()[:220]}
+            for p, text, t, d in results
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if not results:
+        print("(no matches)")
+        return 0
+
+    for path, text, title, dist in results:
+        score = 1 - dist
+        snippet = " ".join(text.split())[:180]
+        rel = Path(path).relative_to(Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser())
+        print(f"{score:.2f}  {rel}")
+        print(f"       {title or ''}")
+        print(f"       {snippet}...")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

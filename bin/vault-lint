@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Vault health check.
+
+Reports:
+  - orphan notes (nothing links to them)
+  - broken wiki-links
+  - missing frontmatter
+  - stale in-progress notes (no change in >N days)
+  - duplicate entity titles (near-identical)
+
+Options:
+  --fix       Apply safe auto-fixes (frontmatter defaults only).
+  --report <path>   Write findings to a file.
+  --stale-days N    Threshold for stale (default 30).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import frontmatter
+except ImportError as e:
+    print(f"vault-lint: missing dependency ({e}). Run: pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+VAULT = Path(os.environ.get("OPENCLAW_VAULT", Path.home() / "vault")).expanduser()
+
+WIKI = re.compile(r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]")
+
+
+def walk() -> list[Path]:
+    return [
+        Path(dp) / n
+        for dp, _, names in os.walk(VAULT)
+        if "/.obsidian" not in dp and "/.git" not in dp
+        for n in names
+        if n.endswith(".md")
+    ]
+
+
+def normalize_link(link: str, source: Path) -> str:
+    link = link.strip()
+    if link.endswith(".md"):
+        link = link[:-3]
+    return link
+
+
+def resolve_link(target: str, files_by_stem: dict[str, list[Path]]) -> Path | None:
+    # Exact path match inside vault
+    candidate = VAULT / (target + ".md")
+    if candidate.exists():
+        return candidate
+    # Fallback: stem match (Obsidian's default)
+    hits = files_by_stem.get(target.split("/")[-1])
+    if hits and len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def lint(files: list[Path], stale_days: int) -> dict:
+    files_by_stem: dict[str, list[Path]] = defaultdict(list)
+    for f in files:
+        files_by_stem[f.stem].append(f)
+
+    inbound: dict[Path, set] = defaultdict(set)
+    broken: list[tuple[Path, str]] = []
+    missing_fm: list[Path] = []
+    stale: list[Path] = []
+    now = time.time()
+    stale_cutoff = now - stale_days * 86400
+
+    for f in files:
+        try:
+            post = frontmatter.load(f)
+        except Exception:
+            post = None
+        body = f.read_text(encoding="utf-8", errors="ignore")
+        if post is None or not post.metadata:
+            missing_fm.append(f)
+        else:
+            if post.metadata.get("status") == "in-progress" and f.stat().st_mtime < stale_cutoff:
+                stale.append(f)
+
+        for m in WIKI.finditer(body):
+            target = normalize_link(m.group(1), f)
+            resolved = resolve_link(target, files_by_stem)
+            if resolved is None:
+                broken.append((f, target))
+            else:
+                inbound[resolved].add(f)
+
+    orphans = [f for f in files if f not in inbound and f.name.lower() not in {"readme.md", "memory.md"}]
+
+    # Duplicate entity detection (very light)
+    dupes: list[tuple[Path, Path]] = []
+    entity_files = [f for f in files if "/entities/" in str(f)]
+    seen: dict[str, Path] = {}
+    for f in entity_files:
+        key = f.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+        if key in seen and seen[key] != f:
+            dupes.append((seen[key], f))
+        else:
+            seen[key] = f
+
+    return {
+        "orphans": orphans,
+        "broken": broken,
+        "missing_fm": missing_fm,
+        "stale": stale,
+        "duplicates": dupes,
+    }
+
+
+def apply_fixes(findings: dict) -> int:
+    """Only safe fixes: add default frontmatter if missing."""
+    count = 0
+    for f in findings["missing_fm"]:
+        body = f.read_text(encoding="utf-8", errors="ignore")
+        if body.startswith("---\n"):
+            continue
+        default = "---\nschema: 1\ntype: note\n---\n\n"
+        f.write_text(default + body, encoding="utf-8")
+        count += 1
+    return count
+
+
+def format_report(findings: dict) -> str:
+    lines = ["# Vault Lint Report", ""]
+    for section, key in [
+        ("Orphans", "orphans"),
+        ("Broken wiki-links", "broken"),
+        ("Missing frontmatter", "missing_fm"),
+        ("Stale (in-progress, no change)", "stale"),
+        ("Duplicate entities", "duplicates"),
+    ]:
+        items = findings[key]
+        lines.append(f"## {section} ({len(items)})")
+        lines.append("")
+        if not items:
+            lines.append("_none_")
+        else:
+            for it in items[:50]:
+                if isinstance(it, tuple) and len(it) == 2 and isinstance(it[1], str):
+                    f, target = it
+                    rel = Path(f).relative_to(VAULT)
+                    lines.append(f"- `{rel}` → `[[{target}]]`")
+                elif isinstance(it, tuple):
+                    a, b = it
+                    lines.append(f"- `{Path(a).relative_to(VAULT)}` ≈ `{Path(b).relative_to(VAULT)}`")
+                else:
+                    lines.append(f"- `{Path(it).relative_to(VAULT)}`")
+            if len(items) > 50:
+                lines.append(f"- _(+ {len(items) - 50} more)_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Vault health check")
+    ap.add_argument("--fix", action="store_true")
+    ap.add_argument("--report")
+    ap.add_argument("--stale-days", type=int, default=30)
+    args = ap.parse_args()
+
+    if not VAULT.exists():
+        print(f"vault-lint: no vault at {VAULT}", file=sys.stderr)
+        return 1
+
+    files = walk()
+    findings = lint(files, args.stale_days)
+
+    fixed = 0
+    if args.fix:
+        fixed = apply_fixes(findings)
+
+    report = format_report(findings)
+    if args.report:
+        Path(args.report).write_text(report, encoding="utf-8")
+    print(report)
+    if args.fix:
+        print(f"\nFixed {fixed} file(s) (frontmatter defaults)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
